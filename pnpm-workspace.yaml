@@ -1,0 +1,15 @@
+packages:
+  - "packages/*"
+  - "tools/*"
+
+allowBuilds:
+  '@google/genai': true
+  onnxruntime-node: true
+  protobufjs: true
+  sharp: true
+
+onlyBuiltDependencies:
+  - "@google/genai"
+  - "onnxruntime-node"
+  - "protobufjs"
+  - "sharp"

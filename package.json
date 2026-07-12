@@ -1,0 +1,39 @@
+{
+  "name": "pi-setups",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal Pi packages, extensions, skills, prompts, and themes.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent"
+  ],
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "check": "pnpm -r run typecheck",
+    "test": "pnpm -r test",
+    "voice:server": "pnpm --filter @jac/pi-voice server",
+    "voice:cli": "pnpm --filter @jac/pi-voice cli"
+  },
+  "pi": {
+    "extensions": [
+      "packages/pi-voice/extensions/index.ts"
+    ],
+    "skills": [
+      "skills"
+    ],
+    "prompts": [
+      "prompts"
+    ],
+    "themes": [
+      "themes"
+    ]
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.14",
+    "typescript": "^5.0.0"
+  }
+}

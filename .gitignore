@@ -1,0 +1,36 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build/check outputs
+dist/
+coverage/
+*.tsbuildinfo
+
+# local env/secrets
+.env
+.env.*
+!.env.example
+
+# Pi/user runtime state (never commit)
+.pi/
+**/.pi/
+*.log
+*.pid
+*.wav
+voice-*.wav
+config.json
+voice.json
+local-repo.env
+manifest.json
+cache/
+tools/tts-bench/results/*
+!tools/tts-bench/results/.gitkeep
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# transcripts & misc
+.ai/

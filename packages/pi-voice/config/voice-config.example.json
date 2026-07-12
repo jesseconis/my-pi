@@ -1,0 +1,33 @@
+{
+  "enabled": true,
+  "backend": "local",
+  "voice": "af_heart",
+  "speed": 1.0,
+  "host": "127.0.0.1",
+  "port": 8181,
+  "defaultModel": "q8",
+  "remote": {
+    "baseUrl": "https://tts.example.com",
+    "authToken": "",
+    "speechPath": "/v1/audio/speech",
+    "streamPath": "/v1/audio/speech/stream",
+    "stream": true,
+    "streamFormat": "pcm",
+    "chunkText": true,
+    "chunkMaxChars": 240
+  },
+  "stt": {
+    "enabled": true,
+    "mode": "local",
+    "language": "en",
+    "audioCues": true
+  },
+  "events": {
+    "message_update": {
+      "content": "thinking"
+    },
+    "message_end": {
+      "content": "text"
+    }
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "name": "@jac/pi-voice",
+  "version": "0.1.0",
+  "description": "Pi voice extension: Kokoro TTS, remote TTS playback, auto-TTS, and local STT dictation.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jesse C",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "pi-coding-agent",
+    "tts",
+    "stt",
+    "kokoro",
+    "speech-synthesis",
+    "dictation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-user/pi-setups.git",
+    "directory": "packages/pi-voice"
+  },
+  "bin": {
+    "pi-voice": "./src/cli.ts"
+  },
+  "files": [
+    "extensions",
+    "src",
+    "config/voice-config.example.json",
+    "scripts/start-pi-voice-server.sh",
+    "scripts/install-server-macos.sh",
+    "launchd/local.pi-voice.plist.template",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "!.github"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --import jiti extensions/server.test.ts",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "tsc --noEmit",
+    "cli": "node --import jiti src/cli.ts",
+    "server": "node --import jiti extensions/server.ts",
+    "prepare-models": "node --import jiti src/prepare.js"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.7.5",
+    "decibri": "^3.4.2",
+    "jiti": "^2.4.2",
+    "kokoro-js": "^1.2.1",
+    "sherpa-onnx-node": "^1.13.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.1.24",
+    "typescript": "^5.0.0"
+  }
+}
