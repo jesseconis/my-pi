@@ -23,13 +23,13 @@ From the monorepo root:
 
 ```bash
 pnpm install
-pi install /Users/jac/pi-setups
+pi install /Users/jac/my-pi
 ```
 
 For a temporary test:
 
 ```bash
-pi -e /Users/jac/pi-setups
+pi -e /Users/jac/my-pi
 ```
 
 ## Optional local TTS server on macOS
@@ -40,7 +40,7 @@ Remote TTS does not need the local server. For local Kokoro inference:
 packages/pi-voice/scripts/install-server-macos.sh
 ```
 
-The installer copies the start script to `~/.pi/voice/`, creates `~/.pi/voice/config.json` only if missing, and writes a LaunchAgent. It does not modify Pi package settings; use `pi install /Users/jac/pi-setups` separately.
+The installer copies the start script to `~/.pi/voice/`, creates `~/.pi/voice/config.json` only if missing, and writes a LaunchAgent. It does not modify Pi package settings; use `pi install /Users/jac/my-pi` separately.
 
 ## Example config
 

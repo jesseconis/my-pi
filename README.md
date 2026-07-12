@@ -1,4 +1,4 @@
-# pi-setups
+# my-pi
 
 Personal monorepo for Pi extensions, skills, prompt templates, and themes.
 
@@ -15,13 +15,13 @@ tools/tts-bench/     Local benchmark utilities, not loaded by Pi
 The root `package.json` is also a Pi package manifest, so one local install can load everything:
 
 ```bash
-pi install /Users/jac/pi-setups
+pi install /Users/jac/my-pi
 ```
 
 For development without permanently installing:
 
 ```bash
-pi -e /Users/jac/pi-setups
+pi -e /Users/jac/my-pi
 ```
 
 ## Runtime config
