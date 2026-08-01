@@ -20,7 +20,8 @@
   },
   "pi": {
     "extensions": [
-      "packages/pi-voice/extensions/index.ts"
+      "packages/pi-voice/extensions/index.ts",
+      "packages/pi-snippets/extensions/index.ts"
     ],
     "skills": [
       "skills"

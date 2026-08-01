@@ -1,0 +1,32 @@
+{
+  "defaultModel": "gpt-5.6-sol",
+  "defaultProvider": "openai-codex",
+  "defaultThinkingLevel": "low",
+  "enableInstallTelemetry": false,
+  "lastChangelogVersion": "0.83.0",
+  "transport": "websocket",
+  "hideThinkingBlock": false,
+  "skills": [
+    "-../../.agents/skills/frontend-design/SKILL.md"
+  ],
+  "terminal": {
+    "showTerminalProgress": true
+  },
+  "doubleEscapeAction": "tree",
+  "theme": "dark",
+  "httpIdleTimeoutMs": 300000,
+  "enableSkillCommands": false,
+  "followUpMode": "all",
+  "warnings": {
+    "anthropicExtraUsage": true
+  },
+  "showCacheMissNotices": true,
+  "treeFilterMode": "all",
+  "steeringMode": "all",
+  "showHardwareCursor": true,
+  "outputPad": 0,
+  "autocompleteMaxVisible": 15,
+  "packages": [
+    "/home/jesse/gh/my-pi"
+  ]
+}

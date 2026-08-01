@@ -15,6 +15,12 @@ coverage/
 # Pi/user runtime state (never commit)
 .pi/
 **/.pi/
+agent/auth.json
+agent/trust.json
+agent/models-store.json
+agent/sessions/
+agent/npm/
+agent/git/
 *.log
 *.pid
 *.wav

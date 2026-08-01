@@ -5,7 +5,9 @@ Personal monorepo for Pi extensions, skills, prompt templates, and themes.
 ## Layout
 
 ```text
+agent/               Tracked global settings, keybindings, and extension config
 packages/pi-voice/   TTS + dictation Pi package based on S1M0N38/pi-voice
+packages/pi-snippets/ Backtick snippet navigation and clipboard package
 skills/              Personal Pi skills
 prompts/             Personal prompt templates
 themes/              Personal themes
@@ -15,14 +17,24 @@ tools/tts-bench/     Local benchmark utilities, not loaded by Pi
 The root `package.json` is also a Pi package manifest, so one local install can load everything:
 
 ```bash
-pi install /Users/jac/my-pi
+pi install /home/jesse/gh/my-pi
 ```
 
 For development without permanently installing:
 
 ```bash
-pi -e /Users/jac/my-pi
+pi -e /home/jesse/gh/my-pi
 ```
+
+## Tracked Pi config
+
+Link the safe JSON configuration in `agent/` into Pi's global config directory:
+
+```bash
+scripts/link-agent-config.sh
+```
+
+Existing files are backed up first. Credentials, sessions, trust decisions, and caches remain untracked under `~/.pi/agent`. Run `/reload` after edits. See [`agent/README.md`](agent/README.md).
 
 ## Runtime config
 

@@ -1,0 +1,10 @@
+{
+  "includeFenced": true,
+  "includeInline": true,
+  "shortcuts": {
+    "show": "ctrl+shift+b",
+    "next": "ctrl+shift+j",
+    "previous": "ctrl+shift+k",
+    "copy": "ctrl+shift+y"
+  }
+}
