@@ -1,9 +1,9 @@
 {
-  "defaultModel": "gpt-5.6-sol",
-  "defaultProvider": "openai-codex",
-  "defaultThinkingLevel": "low",
+  "defaultModel": "deepseek-v4-pro",
+  "defaultProvider": "deepseek",
+  "defaultThinkingLevel": "high",
   "enableInstallTelemetry": false,
-  "lastChangelogVersion": "0.83.0",
+  "lastChangelogVersion": "0.84.0",
   "transport": "websocket",
   "hideThinkingBlock": false,
   "skills": [
@@ -15,7 +15,7 @@
   "doubleEscapeAction": "tree",
   "theme": "dark",
   "httpIdleTimeoutMs": 300000,
-  "enableSkillCommands": false,
+  "enableSkillCommands": true,
   "followUpMode": "all",
   "warnings": {
     "anthropicExtraUsage": true
@@ -23,10 +23,10 @@
   "showCacheMissNotices": true,
   "treeFilterMode": "all",
   "steeringMode": "all",
-  "showHardwareCursor": true,
+  "showHardwareCursor": false,
   "outputPad": 0,
   "autocompleteMaxVisible": 15,
   "packages": [
-    "/home/jesse/gh/my-pi"
+    "../../gh/my-pi"
   ]
 }
