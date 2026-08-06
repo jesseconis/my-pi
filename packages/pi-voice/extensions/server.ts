@@ -392,12 +392,35 @@ async function handleModelsUnload(_req: IncomingMessage, res: ServerResponse) {
 // ── TTS request queue (serializes /tts calls — one synthesis at a time) ────
 let ttsQueueTail: Promise<void> = Promise.resolve();
 let ttsQueueDepth = 0;
+const cancelledTtsRequests = new Set<string>();
+const cancellationTimers = new Map<string, NodeJS.Timeout>();
+
+function markTtsRequestCancelled(requestId: string): void {
+  cancelledTtsRequests.add(requestId);
+  const previous = cancellationTimers.get(requestId);
+  if (previous) clearTimeout(previous);
+  const timer = setTimeout(() => {
+    cancelledTtsRequests.delete(requestId);
+    cancellationTimers.delete(requestId);
+  }, 5 * 60_000);
+  timer.unref();
+  cancellationTimers.set(requestId, timer);
+}
+
+function clearTtsRequestCancellation(requestId: string | undefined): void {
+  if (!requestId) return;
+  cancelledTtsRequests.delete(requestId);
+  const timer = cancellationTimers.get(requestId);
+  if (timer) clearTimeout(timer);
+  cancellationTimers.delete(requestId);
+}
 
 function enqueueTTS<T>(
   label: string,
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
   fn: () => Promise<T>,
+  isCancelled: () => boolean = () => false,
 ): Promise<T> {
   ttsQueueDepth++;
   const depth = ttsQueueDepth;
@@ -411,65 +434,93 @@ function enqueueTTS<T>(
     disconnected = true;
   };
   res.on("close", onClose);
+  req.on("aborted", onClose);
+  req.socket.on("close", onClose);
+
+  const removeDisconnectListeners = () => {
+    res.removeListener("close", onClose);
+    req.removeListener("aborted", onClose);
+    req.socket.removeListener("close", onClose);
+  };
 
   return new Promise<T>((resolve, reject) => {
     ttsQueueTail = ttsQueueTail.then(async () => {
       ttsQueueDepth--;
-      res.removeListener("close", onClose);
 
       // Client disconnected while waiting — skip synthesis
-      if (disconnected) {
-        console.log(`[pi-voice] Queue: skipping "${label}" (client disconnected)`);
-        reject(new Error("Client disconnected"));
+      if (disconnected || isCancelled()) {
+        removeDisconnectListeners();
+        console.log(
+          `[pi-voice] Queue: skipping "${label}" (${isCancelled() ? "cancelled" : "client disconnected"})`,
+        );
+        reject(new Error(isCancelled() ? "Client cancelled" : "Client disconnected"));
         return;
       }
 
       console.log(`[pi-voice] Queue: processing "${label}"`);
       try {
-        resolve(await fn());
+        const value = await fn();
+        if (disconnected || isCancelled()) {
+          console.log(
+            `[pi-voice] Queue: discarding "${label}" (${isCancelled() ? "cancelled" : "client disconnected"})`,
+          );
+          reject(new Error(isCancelled() ? "Client cancelled" : "Client disconnected"));
+        } else {
+          resolve(value);
+        }
       } catch (err) {
         reject(err);
+      } finally {
+        removeDisconnectListeners();
       }
     });
   });
 }
 
 async function handleTTS(req: IncomingMessage, res: ServerResponse) {
+  let requestId: string | undefined;
   try {
     // Read the body outside the queue so the request is fully consumed
     // before entering the queue (avoids hanging on slow clients).
     const rawBody = await readBody(req);
     const body = JSON.parse(rawBody);
+    requestId = typeof body.requestId === "string" ? body.requestId.slice(0, 200) : undefined;
     const text = (body.text as string | undefined)?.trim();
     const label = text ? `"${text.slice(0, 40)}${text.length > 40 ? "..." : ""}"` : "(empty)";
 
-    const result = await enqueueTTS(label, req, res, async () => {
-      if (!tts || !activeDtype) {
-        return {
-          error: "No model loaded. Download and activate a model first.",
-          status: 503,
-        } as const;
-      }
+    const result = await enqueueTTS(
+      label,
+      req,
+      res,
+      async () => {
+        if (!tts || !activeDtype) {
+          return {
+            error: "No model loaded. Download and activate a model first.",
+            status: 503,
+          } as const;
+        }
 
-      if (!text) {
-        return { error: "Missing or empty 'text' field", status: 400 } as const;
-      }
+        if (!text) {
+          return { error: "Missing or empty 'text' field", status: 400 } as const;
+        }
 
-      const voice = (body.voice as string) || "af_heart";
-      const speed = Number(body.speed ?? 1.0);
+        const voice = (body.voice as string) || "af_heart";
+        const speed = Number(body.speed ?? 1.0);
 
-      console.log(
-        `[pi-voice] Synthesizing: "${text.slice(0, 60)}${text.length > 60 ? "..." : ""}" (voice=${voice}, speed=${speed}, dtype=${activeDtype})`,
-      );
+        console.log(
+          `[pi-voice] Synthesizing: "${text.slice(0, 60)}${text.length > 60 ? "..." : ""}" (voice=${voice}, speed=${speed}, dtype=${activeDtype})`,
+        );
 
-      const audio = await tts.generate(text, {
-        voice: voice as keyof typeof tts.voices,
-        speed,
-      });
-      const samples = audio.audio as Float32Array;
-      const sampleRate = audio.sampling_rate;
-      return { wav: float32ToWav(samples, sampleRate) } as const;
-    });
+        const audio = await tts.generate(text, {
+          voice: voice as keyof typeof tts.voices,
+          speed,
+        });
+        const samples = audio.audio as Float32Array;
+        const sampleRate = audio.sampling_rate;
+        return { wav: float32ToWav(samples, sampleRate) } as const;
+      },
+      () => !!requestId && cancelledTtsRequests.has(requestId),
+    );
 
     if ("error" in result) {
       json(res, { error: result.error }, result.status);
@@ -482,13 +533,33 @@ async function handleTTS(req: IncomingMessage, res: ServerResponse) {
     }
   } catch (err) {
     // Don't log client disconnect as an error — it's expected behavior
-    if (err instanceof Error && err.message === "Client disconnected") {
+    if (
+      err instanceof Error &&
+      (err.message === "Client disconnected" || err.message === "Client cancelled")
+    ) {
       return;
     }
     console.error("[pi-voice] TTS error:", err);
     if (!res.headersSent) {
       json(res, { error: err instanceof Error ? err.message : String(err) }, 500);
     }
+  } finally {
+    clearTtsRequestCancellation(requestId);
+  }
+}
+
+async function handleTTSCancel(req: IncomingMessage, res: ServerResponse) {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const requestId = typeof body.requestId === "string" ? body.requestId.slice(0, 200) : "";
+    if (!requestId) {
+      json(res, { error: "Missing requestId" }, 400);
+      return;
+    }
+    markTtsRequestCancelled(requestId);
+    json(res, { cancelled: true, requestId });
+  } catch (error) {
+    json(res, { error: error instanceof Error ? error.message : String(error) }, 400);
   }
 }
 
@@ -563,6 +634,9 @@ const server = createServer(async (req, res) => {
     }
     if (path === "/tts" && req.method === "POST") {
       return await handleTTS(req, res);
+    }
+    if (path === "/tts/cancel" && req.method === "POST") {
+      return await handleTTSCancel(req, res);
     }
     if (path === "/shutdown" && req.method === "POST") {
       return handleShutdown(req, res);

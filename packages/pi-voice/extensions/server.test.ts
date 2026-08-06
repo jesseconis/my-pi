@@ -98,6 +98,19 @@ function assertWav(buf: Buffer): void {
 describe("Kokoro TTS Server", () => {
   let serverProcess: ReturnType<typeof spawn> | null = null;
   let testVoiceDir: string | null = null;
+  const serverStdout: string[] = [];
+
+  async function waitForServerLog(
+    predicate: (line: string) => boolean,
+    timeoutMs = 5000,
+  ): Promise<void> {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (serverStdout.some(predicate)) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`Timed out waiting for server log:\n${serverStdout.join("\n")}`);
+  }
 
   before(async () => {
     testVoiceDir = mkdtempSync(join(tmpdir(), "pi-voice-test-"));
@@ -115,6 +128,9 @@ describe("Kokoro TTS Server", () => {
       for (const line of chunk.toString().split("\n")) {
         if (line.trim()) console.log(`  [server] ${line}`);
       }
+    });
+    serverProcess.stdout?.on("data", (chunk: Buffer) => {
+      serverStdout.push(...chunk.toString().split("\n").filter(Boolean));
     });
 
     await waitForServer();
@@ -386,6 +402,39 @@ describe("Kokoro TTS Server", () => {
 
       // Give the server a moment to process the disconnect
       await new Promise((r) => setTimeout(r, 500));
+    });
+
+    it("accepts explicit cancellation while active inference finishes and recovers", async () => {
+      serverStdout.length = 0;
+      const controller = new AbortController();
+      const requestId = `test-cancel-${Date.now()}`;
+      const request = fetch(url("/tts"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: "This active synthesis request should be discarded after the client disconnects.",
+          requestId,
+        }),
+        signal: controller.signal,
+      });
+
+      await waitForServerLog(
+        (line) => line.includes("Queue: processing") && line.includes("This active synthesis"),
+      );
+      const cancellation = post("/tts/cancel", { requestId });
+      controller.abort();
+      await assert.rejects(request, (error: unknown) => {
+        return error instanceof Error && error.name === "AbortError";
+      });
+      assert.equal((await cancellation).status, 200);
+
+      const { status, body } = await fetchBinary("/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "After active cancellation" }),
+      });
+      assert.equal(status, 200);
+      assertWav(body);
     });
 
     it("queue recovers after a failed request", async () => {

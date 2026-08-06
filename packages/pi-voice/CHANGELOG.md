@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Configurable FIFO, pending-drop, and new-input interruption policies for speech jobs.
+- Turn-aware cancellation across summaries, HTTP synthesis, PCM streams, and audio players.
+- Deterministic code and tool-output speech profiles with optional targeted LLM summaries.
+- Role filters and named processing profiles for automatic speech events.
+- Externally reloadable, context-scoped pronunciation rules.
+
+### Fixed
+
+- Preserve unrelated runtime config keys when saving voice and speed defaults.
+- Isolate event tests from the user's real `~/.pi/voice/config.json`.
+- Prevent cancelled local TTS results from being played and skip queued cancelled requests.
+
 ## [2.0.1](https://github.com/S1M0N38/pi-voice/compare/v2.0.0...v2.0.1) (2026-05-07)
 
 

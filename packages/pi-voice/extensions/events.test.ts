@@ -16,19 +16,26 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
-import extensionFactory, {
-  containsFencedCodeBlock,
-  prepareTextForSpeech,
-} from "./index.ts";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 
 // ── Constants ──────────────────────────────────────────────────────
 
-const CONFIG_DIR = resolve(homedir(), ".pi", "voice");
+const CONFIG_DIR = mkdtempSync(join(tmpdir(), "pi-voice-events-"));
 const CONFIG_PATH = resolve(CONFIG_DIR, "config.json");
+process.env.PI_VOICE_DIR = CONFIG_DIR;
+const { default: extensionFactory, containsFencedCodeBlock, prepareTextForSpeech } = await import(
+  "./index.ts"
+);
 const KEY_ESCAPE = "\x1b";
 const KEY_ENTER = "\r";
 const KEY_LEFT = "\x1b[D";
@@ -66,6 +73,10 @@ interface VoiceSpeakEndEvent {
 // ── Config backup / restore ────────────────────────────────────────
 
 let configBackup: string | null = null;
+
+after(() => {
+  rmSync(CONFIG_DIR, { recursive: true, force: true });
+});
 
 function backupConfig() {
   try {
@@ -402,6 +413,24 @@ describe("pi-voice event system", () => {
 
       const events = getEvents(pi, "voice:config");
       assert.ok(events.length >= 1, "Reset should emit voice:config");
+    });
+
+    it("preserves unrelated config keys when saving defaults", async () => {
+      writeTestConfig({ defaultModel: "q8", customSetting: { retained: true } });
+      const pi = createMockPi();
+      // biome-ignore lint/suspicious/noExplicitAny: mock pi cast
+      extensionFactory(pi as any);
+
+      const handlerPromise = commands.voice.handler([], createMockCtx());
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.ok(tuiComponent);
+      tuiComponent.handleInput("s");
+      tuiComponent.handleInput(KEY_ESCAPE);
+      await handlerPromise;
+
+      const saved = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+      assert.equal(saved.defaultModel, "q8");
+      assert.deepEqual(saved.customSetting, { retained: true });
     });
   });
 
@@ -820,6 +849,277 @@ describe("pi-voice event system", () => {
     });
   });
 
+  describe("turn-aware interruption", () => {
+    it("interrupts stale speech on submitted input and accepts the next response", async () => {
+      writeTestConfig({
+        speech: { queue: { onUserInput: "interrupt" } },
+        events: { message_end: { content: "text", roles: ["assistant"] } },
+      });
+      let ttsRequests = 0;
+      let firstRequestAborted = false;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (!url.endsWith("/tts")) {
+          return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+        }
+        ttsRequests++;
+        if (ttsRequests > 1) return new Response(createValidWav(), { status: 200 });
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => {
+            firstRequestAborted = true;
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          init?.signal?.addEventListener("abort", abort, { once: true });
+          if (init?.signal?.aborted) abort();
+        });
+      }) as typeof fetch;
+
+      const pi = createMockPi();
+      // biome-ignore lint/suspicious/noExplicitAny: mock pi cast
+      extensionFactory(pi as any);
+      const ctx = createMockCtx();
+      await piEventHandlers.message_end(
+        { message: { role: "assistant", content: [{ type: "text", text: "Old response." }] } },
+        ctx,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await piEventHandlers.input({ text: "Continue", source: "interactive" }, ctx);
+      await piEventHandlers.message_start(
+        { message: { role: "user", content: "Continue" } },
+        ctx,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await piEventHandlers.message_end(
+        { message: { role: "assistant", content: [{ type: "text", text: "New response." }] } },
+        ctx,
+      );
+      await new Promise((resolve) => setTimeout(resolve, PLAYBACK_SETTLE));
+
+      assert.equal(firstRequestAborted, true);
+      const starts = getEvents(pi, "voice:speak_start").map(
+        (event) => (event.data as VoiceSpeakStartEvent).text,
+      );
+      assert.deepEqual(starts, ["Old response.", "New response."]);
+      const cancelled = getEvents(pi, "voice:speak_end").find(
+        (event) => (event.data as VoiceSpeakEndEvent & { cancelled?: boolean }).cancelled,
+      );
+      assert.ok(cancelled, "stale active speech should end as cancelled");
+    });
+
+    it("suppresses responses until the newest rapidly queued input starts", async () => {
+      writeTestConfig({
+        speech: { queue: { onUserInput: "interrupt" } },
+        events: { message_end: { content: "text", roles: ["assistant"] } },
+      });
+      const pi = createMockPi();
+      // biome-ignore lint/suspicious/noExplicitAny: mock pi cast
+      extensionFactory(pi as any);
+      const ctx = createMockCtx();
+
+      await piEventHandlers.input(
+        { text: "First", source: "interactive", streamingBehavior: "followUp" },
+        ctx,
+      );
+      await piEventHandlers.input(
+        { text: "Second", source: "interactive", streamingBehavior: "followUp" },
+        ctx,
+      );
+      await piEventHandlers.message_start(
+        { message: { role: "user", content: "First" } },
+        ctx,
+      );
+      await piEventHandlers.message_end(
+        {
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Response to first." }],
+          },
+        },
+        ctx,
+      );
+      await piEventHandlers.message_start(
+        { message: { role: "user", content: "Second" } },
+        ctx,
+      );
+      await piEventHandlers.message_end(
+        {
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Response to second." }],
+          },
+        },
+        ctx,
+      );
+      await new Promise((resolve) => setTimeout(resolve, PLAYBACK_SETTLE));
+
+      const starts = getEvents(pi, "voice:speak_start").map(
+        (event) => (event.data as VoiceSpeakStartEvent).text,
+      );
+      assert.deepEqual(starts, ["Response to second."]);
+    });
+
+    it("drops an unmatched idle input generation before the next valid prompt", async () => {
+      writeTestConfig({
+        speech: { queue: { onUserInput: "interrupt" } },
+        events: { message_end: { content: "text", roles: ["assistant"] } },
+      });
+      const pi = createMockPi();
+      // biome-ignore lint/suspicious/noExplicitAny: mock pi cast
+      extensionFactory(pi as any);
+      const ctx = createMockCtx();
+      await piEventHandlers.input({ text: "Handled elsewhere", source: "interactive" }, ctx);
+      await piEventHandlers.input({ text: "Valid prompt", source: "interactive" }, ctx);
+      await piEventHandlers.message_start(
+        { message: { role: "user", content: "Valid prompt" } },
+        ctx,
+      );
+      await piEventHandlers.message_end(
+        {
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Valid response." }],
+          },
+        },
+        ctx,
+      );
+      await new Promise((resolve) => setTimeout(resolve, PLAYBACK_SETTLE));
+      const starts = getEvents(pi, "voice:speak_start").map(
+        (event) => (event.data as VoiceSpeakStartEvent).text,
+      );
+      assert.deepEqual(starts, ["Valid response."]);
+    });
+  });
+
+  describe("technical tool monitoring", () => {
+    it("uses tool arguments and bounded technical processing", async () => {
+      writeTestConfig({
+        events: { message_end: { content: "text", roles: ["toolResult"] } },
+      });
+      const pi = createMockPi();
+      // biome-ignore lint/suspicious/noExplicitAny: mock pi cast
+      extensionFactory(pi as any);
+      const ctx = createMockCtx();
+      await piEventHandlers.tool_execution_start({
+        toolCallId: "tool-1",
+        toolName: "bash",
+        args: { command: "systemctl status nginx" },
+      });
+      await piEventHandlers.message_end(
+        {
+          message: {
+            role: "toolResult",
+            toolCallId: "tool-1",
+            toolName: "bash",
+            isError: false,
+            content: [
+              {
+                type: "text",
+                text: "service active\n550e8400-e29b-41d4-a716-446655440000\n1048576 bytes",
+              },
+            ],
+          },
+        },
+        ctx,
+      );
+      await new Promise((resolve) => setTimeout(resolve, PLAYBACK_SETTLE));
+      const spoken = (getEvents(pi, "voice:speak_start")[0]?.data as VoiceSpeakStartEvent).text;
+      assert.match(spoken, /Bash command systemctl status nginx succeeded/);
+      assert.match(spoken, /UUID 550e8400\.\.\.0000/);
+      assert.match(spoken, /1 megabyte/);
+    });
+
+    it("honors assistant-only role filters", async () => {
+      writeTestConfig({
+        events: { message_end: { content: "text", roles: ["assistant"] } },
+      });
+      const pi = createMockPi();
+      // biome-ignore lint/suspicious/noExplicitAny: mock pi cast
+      extensionFactory(pi as any);
+      await piEventHandlers.message_end(
+        {
+          message: {
+            role: "toolResult",
+            toolCallId: "tool-2",
+            toolName: "bash",
+            isError: false,
+            content: [{ type: "text", text: "Large tool output" }],
+          },
+        },
+        createMockCtx(),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(getEvents(pi, "voice:speak_start").length, 0);
+    });
+
+    it("extracts tool results from turn_end and retains their call arguments", async () => {
+      writeTestConfig({
+        events: { turn_end: { content: "text", roles: ["toolResult"] } },
+      });
+      const pi = createMockPi();
+      // biome-ignore lint/suspicious/noExplicitAny: mock pi cast
+      extensionFactory(pi as any);
+      const ctx = createMockCtx();
+      await piEventHandlers.tool_execution_start({
+        toolCallId: "tool-turn",
+        toolName: "bash",
+        args: { command: "pnpm test" },
+      });
+      await piEventHandlers.turn_end(
+        {
+          message: { role: "assistant", content: [{ type: "text", text: "Running tests." }] },
+          toolResults: [
+            {
+              role: "toolResult",
+              toolCallId: "tool-turn",
+              toolName: "bash",
+              isError: false,
+              content: [{ type: "text", text: "104 tests passed" }],
+            },
+          ],
+        },
+        ctx,
+      );
+      await new Promise((resolve) => setTimeout(resolve, PLAYBACK_SETTLE));
+      const spoken = (getEvents(pi, "voice:speak_start")[0]?.data as VoiceSpeakStartEvent).text;
+      assert.match(spoken, /Bash command pnpm test succeeded/);
+      assert.match(spoken, /104 tests passed/);
+    });
+  });
+
+  describe("streaming technical text", () => {
+    it("keeps a long closed code fence atomic before speech preparation", async () => {
+      writeTestConfig({
+        remote: { chunkMaxChars: 80 },
+        events: { message_update: { content: "text", roles: ["assistant"] } },
+      });
+      const pi = createMockPi();
+      // biome-ignore lint/suspicious/noExplicitAny: mock pi cast
+      extensionFactory(pi as any);
+      const code = [
+        "```ts",
+        "export function configure(options: Options) {",
+        "```not-a-closing-fence",
+        "  const enabled = options.enabled && options.ready;",
+        "  return enabled ? options.value : options.fallback;",
+        "}",
+        "```",
+      ].join("\n");
+      await piEventHandlers.message_update({
+        assistantMessageEvent: { type: "text_delta", delta: code },
+      });
+      await piEventHandlers.message_update({ assistantMessageEvent: { type: "text_end" } });
+      await new Promise((resolve) => setTimeout(resolve, PLAYBACK_SETTLE));
+      const starts = getEvents(pi, "voice:speak_start").map(
+        (event) => (event.data as VoiceSpeakStartEvent).text,
+      );
+      assert.equal(starts.length, 1);
+      assert.match(starts[0] ?? "", /TypeScript block defines function configure/);
+      assert.doesNotMatch(starts[0] ?? "", /return enabled/);
+    });
+  });
+
   // ── auto-TTS (no model available) ──────────────────────────────
 
   describe("auto-TTS without model", () => {
@@ -903,7 +1203,7 @@ function add(a: number, b: number) {
 
 Then run tests.`);
 
-      assert.match(prepared, /TypeScript code block with 3 non empty lines/);
+      assert.match(prepared, /TypeScript block defines function add/);
       assert.doesNotMatch(prepared, /```/);
       assert.doesNotMatch(prepared, /return a \+ b/);
     });
@@ -915,7 +1215,7 @@ Then run tests.`);
 
     it("handles unterminated fenced code blocks without throwing", () => {
       const prepared = prepareTextForSpeech("```bash\nnpm test");
-      assert.match(prepared, /shell code block with 1 non empty lines/);
+      assert.match(prepared, /Shell commands: npm test/);
     });
   });
 });

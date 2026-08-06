@@ -22,12 +22,54 @@
     "language": "en",
     "audioCues": true
   },
+  "speech": {
+    "queue": {
+      "onUserInput": "interrupt",
+      "inputSources": ["interactive", "rpc"]
+    },
+    "processing": {
+      "defaultProfile": "monitor",
+      "pronunciationFile": "pronunciations.json",
+      "profiles": {
+        "monitor": {
+          "base": "technical",
+          "limits": {
+            "maxLines": 12,
+            "maxChars": 1200
+          },
+          "code": {
+            "shortMaxLines": 3,
+            "shortMaxChars": 240,
+            "longMode": "outline"
+          },
+          "toolOutput": {
+            "headLines": 6,
+            "tailLines": 4,
+            "longMode": "bounded"
+          }
+        },
+        "monitorWithLlm": {
+          "base": "technical",
+          "code": {
+            "longMode": "llm"
+          },
+          "toolOutput": {
+            "longMode": "llm"
+          }
+        }
+      }
+    }
+  },
   "events": {
     "message_update": {
-      "content": "thinking"
+      "content": "thinking",
+      "roles": ["assistant"],
+      "profile": "monitor"
     },
     "message_end": {
-      "content": "text"
+      "content": "text",
+      "roles": ["assistant", "toolResult"],
+      "profile": "monitor"
     }
   }
 }

@@ -28,6 +28,7 @@
     "extensions",
     "src",
     "config/voice-config.example.json",
+    "config/pronunciations.example.json",
     "scripts/start-pi-voice-server.sh",
     "scripts/install-server-macos.sh",
     "launchd/local.pi-voice.plist.template",
@@ -45,8 +46,8 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node --import jiti extensions/server.test.ts",
-    "lint": "biome check .",
+    "test": "node --import jiti --test extensions/*.test.ts",
+    "lint": "biome check --formatter-enabled=false .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
     "typecheck": "tsc --noEmit",

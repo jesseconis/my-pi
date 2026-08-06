@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "match": "ctl",
+      "replace": " control",
+      "mode": "suffix",
+      "scope": {
+        "kinds": ["prose", "inlineCode", "command"]
+      }
+    },
+    {
+      "match": "~",
+      "replace": "home",
+      "mode": "pathSegment",
+      "scope": {
+        "kinds": ["path"]
+      }
+    },
+    {
+      "match": "etc",
+      "replace": "etsy",
+      "mode": "pathSegment",
+      "scope": {
+        "kinds": ["path"]
+      }
+    }
+  ]
+}

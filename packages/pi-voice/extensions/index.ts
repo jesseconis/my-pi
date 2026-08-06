@@ -30,7 +30,7 @@
  *     Uses session overrides > global defaults.
  */
 
-import { exec as execCb, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   appendFileSync,
   existsSync,
@@ -43,11 +43,28 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  DEFAULT_SPEECH_CONFIG,
+  loadPronunciations,
+  normalizeSpeechConfig,
+  resolveConfiguredProfile,
+  type SpeechVoiceConfig,
+} from "./config.ts";
+import { type SpeechCancellationReason, SpeechScheduler } from "./speech-runtime.ts";
+import {
+  codeSummaryTargets,
+  type PronunciationFile,
+  prepareSpeechText,
+  type SpeechContext,
+  type SpeechProfileConfig,
+  type SpeechRole,
+  shouldSummarizeToolOutput,
+} from "./speech-text.ts";
+import {
   defaultSttModelDir,
-  startLocalSttSession,
   type LocalSttSession,
   type SttProgress,
   type SttRuntimeConfig,
+  startLocalSttSession,
 } from "./stt.ts";
 
 const Type = await loadTypebox();
@@ -115,15 +132,20 @@ interface SummarizeEventConfig {
   model?: ModelConfig;
   /** Which assistant content blocks to summarize/speak. Defaults to final text only. */
   content?: SpeechContentMode;
+  roles?: SpeechRole[];
+  profile?: string;
 }
 
 interface DirectEventConfig {
   text: string;
+  profile?: string;
 }
 
 interface RawEventConfig {
   /** Which assistant content blocks to speak directly. Defaults to final text only. */
   content?: SpeechContentMode;
+  roles?: SpeechRole[];
+  profile?: string;
 }
 
 interface FullVoiceConfig {
@@ -135,6 +157,7 @@ interface FullVoiceConfig {
   port: number;
   remote?: RemoteVoiceConfig;
   stt?: SttVoiceConfig;
+  speech?: SpeechVoiceConfig;
   events?: Record<string, EventConfig>;
 }
 
@@ -188,6 +211,8 @@ export interface VoiceSpeakEndEvent {
   text: string;
   source: VoiceSpeakSource;
   error?: string;
+  cancelled?: boolean;
+  cancellationReason?: string;
 }
 
 export interface VoiceEventMap {
@@ -195,74 +220,6 @@ export interface VoiceEventMap {
   "voice:speak_start": VoiceSpeakStartEvent;
   "voice:speak_end": VoiceSpeakEndEvent;
 }
-
-// ── Configuration Schema (TypeBox) ───────────────────────────────
-
-const ModelSchema = Type.Object({
-  provider: Type.String({ minLength: 1 }),
-  id: Type.String({ minLength: 1 }),
-});
-
-const SpeechContentModeSchema = Type.Union([
-  Type.Literal("text"),
-  Type.Literal("thinking"),
-  Type.Literal("all"),
-]);
-
-const SummarizeEventConfigSchema = Type.Object({
-  prompt: Type.String({ minLength: 1 }),
-  model: Type.Optional(ModelSchema),
-  content: Type.Optional(SpeechContentModeSchema),
-});
-
-const DirectEventConfigSchema = Type.Object({
-  text: Type.String({ minLength: 1 }),
-});
-
-const RawEventConfigSchema = Type.Object({
-  content: Type.Optional(SpeechContentModeSchema),
-});
-
-const EventConfigSchema = Type.Union([
-  SummarizeEventConfigSchema,
-  DirectEventConfigSchema,
-  RawEventConfigSchema,
-]);
-
-const _VoiceConfigSchema = Type.Object({
-  enabled: Type.Optional(Type.Boolean({ default: true })),
-  voice: Type.Optional(Type.String({ default: "af_heart" })),
-  speed: Type.Optional(Type.Number({ minimum: 0.5, maximum: 3.0, default: 1.0 })),
-  backend: Type.Optional(Type.Union([Type.Literal("local"), Type.Literal("remote")])),
-  host: Type.Optional(Type.String({ default: "127.0.0.1" })),
-  port: Type.Optional(Type.Number({ minimum: 1, maximum: 65535, default: 8181 })),
-  remote: Type.Optional(
-    Type.Object({
-      baseUrl: Type.Optional(Type.String({ minLength: 1 })),
-      host: Type.Optional(Type.String({ minLength: 1 })),
-      port: Type.Optional(Type.Number({ minimum: 1, maximum: 65535 })),
-      authToken: Type.Optional(Type.String()),
-      speechPath: Type.Optional(Type.String({ minLength: 1 })),
-      streamPath: Type.Optional(Type.String({ minLength: 1 })),
-      stream: Type.Optional(Type.Boolean()),
-      streamFormat: Type.Optional(Type.Union([Type.Literal("pcm"), Type.Literal("wav")])),
-      chunkText: Type.Optional(Type.Boolean()),
-      chunkMaxChars: Type.Optional(Type.Number({ minimum: 80, maximum: 2000 })),
-    }),
-  ),
-  stt: Type.Optional(
-    Type.Object({
-      enabled: Type.Optional(Type.Boolean()),
-      mode: Type.Optional(Type.Literal("local")),
-      modelDir: Type.Optional(Type.String({ minLength: 1 })),
-      language: Type.Optional(Type.String({ minLength: 1 })),
-      audioCues: Type.Optional(Type.Boolean()),
-      startCue: Type.Optional(Type.String({ minLength: 1 })),
-      finishCue: Type.Optional(Type.String({ minLength: 1 })),
-    }),
-  ),
-  events: Type.Optional(Type.Record(Type.String(), EventConfigSchema)),
-});
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -293,19 +250,15 @@ const DEFAULT_SUMMARY_PROMPT =
   "Prefer words over symbols or abbreviations, as this will be read aloud. " +
   "Output only the sentence, nothing else.";
 
-const CODEBLOCK_SPEECH_PROMPT =
-  "You are preparing an assistant response for a text-to-speech system. " +
-  "Convert the message into concise, natural spoken language. " +
-  "If it contains code blocks, do not read syntax literally. " +
-  "Instead, briefly explain what the code does and mention only important commands, " +
-  "identifiers, files, errors, or APIs. " +
-  "Do not use markdown formatting, code fences, bullets, or symbol-heavy text. " +
-  "Output only plain text.";
+const TECHNICAL_CODE_SUMMARY_PROMPT =
+  "Summarize only the supplied code blocks for spoken monitoring. Preserve important commands, " +
+  "identifiers, files, errors, and APIs. Return JSON only as an array of objects with numeric id " +
+  'and plain-text summary fields, for example [{"id":0,"summary":"Defines loadConfig."}].';
 
-const CODEBLOCK_PROMPT_SUFFIX =
-  " If the source includes code blocks, do not read syntax literally; briefly paraphrase " +
-  "what the code does and mention only important commands, identifiers, files, errors, or APIs. " +
-  "Output plain spoken text only.";
+const TECHNICAL_TOOL_SUMMARY_PROMPT =
+  "Summarize this tool result for spoken monitoring. Preserve the tool name, command or file when " +
+  "provided, success or failure, important errors, and consequential values. Omit opaque identifiers " +
+  "and repetitive output. Return one concise plain-text paragraph with no Markdown.";
 
 const DEFAULT_REMOTE_CONFIG: Required<RemoteVoiceConfig> = {
   baseUrl: "http://127.0.0.1:8880",
@@ -384,106 +337,12 @@ function voiceHint(name: string): string {
   return lang;
 }
 
-function spokenLanguageName(info: string): string {
-  const language = info.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
-  const map: Record<string, string> = {
-    bash: "shell",
-    js: "JavaScript",
-    javascript: "JavaScript",
-    json: "JSON",
-    md: "Markdown",
-    py: "Python",
-    python: "Python",
-    sh: "shell",
-    shell: "shell",
-    ts: "TypeScript",
-    tsx: "TypeScript React",
-    typescript: "TypeScript",
-  };
-  return map[language] ?? language;
-}
-
-function describeCodeBlock(info: string, codeLines: string[]): string {
-  const language = spokenLanguageName(info);
-  const nonEmptyLines = codeLines.filter((line) => line.trim()).length;
-  const languageText = language ? `${language} ` : "";
-  const lineText = nonEmptyLines > 0 ? ` with ${nonEmptyLines} non empty lines` : "";
-  return `The response includes a ${languageText}code block${lineText}.`;
-}
-
 export function containsFencedCodeBlock(text: string): boolean {
   return /^\s*(`{3,}|~{3,})/m.test(text);
 }
 
-function replaceFencedCodeBlocks(text: string): string {
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
-  const output: string[] = [];
-  let inCodeBlock = false;
-  let fenceChar = "`";
-  let fenceLength = 3;
-  let info = "";
-  let codeLines: string[] = [];
-
-  for (const line of lines) {
-    if (!inCodeBlock) {
-      const opening = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
-      if (opening?.[1]) {
-        inCodeBlock = true;
-        fenceChar = opening[1][0] ?? "`";
-        fenceLength = opening[1].length;
-        info = opening[2] ?? "";
-        codeLines = [];
-        continue;
-      }
-      output.push(line);
-      continue;
-    }
-
-    const closing = line.match(/^\s*(`{3,}|~{3,})\s*$/);
-    if (
-      closing?.[1] &&
-      closing[1][0] === fenceChar &&
-      closing[1].length >= fenceLength
-    ) {
-      output.push(describeCodeBlock(info, codeLines));
-      inCodeBlock = false;
-      info = "";
-      codeLines = [];
-      continue;
-    }
-
-    codeLines.push(line);
-  }
-
-  if (inCodeBlock) {
-    output.push(describeCodeBlock(info, codeLines));
-  }
-
-  return output.join("\n");
-}
-
 export function prepareTextForSpeech(text: string): string {
-  return replaceFencedCodeBlocks(text)
-    .replace(/\r\n/g, "\n")
-    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
-    .replace(/^\s{0,3}>\s?/gm, "")
-    .replace(/^\s*[-*_]{3,}\s*$/gm, "")
-    .replace(/^\s*[-*+]\s+/gm, "")
-    .replace(/^\s*\d+[.)]\s+/gm, "")
-    .replace(/`([^`\n]+)`/g, "$1")
-    .replace(/(\*\*\*|___)([^\n]+?)\1/g, "$2")
-    .replace(/(\*\*|__)([^\n]+?)\1/g, "$2")
-    .replace(/\*([^\n]+?)\*/g, "$1")
-    .replace(/(^|[\s([{])_([^_\n]+?)_($|[\s)\]},.!?;:])/g, "$1$2$3")
-    .replace(/[*]+/g, "")
-    .replace(/_{2,}/g, "")
-    .replace(/`+/g, "")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\s+([.,;:!?])/g, "$1")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return prepareSpeechText(text);
 }
 
 function trimTrailingSlash(value: string): string {
@@ -630,12 +489,6 @@ function streamingPcmPlayer(): { command: string; args: string[] } | null {
   return null;
 }
 
-function withCodeblockInstructions(prompt: string): string {
-  return prompt.includes(CODEBLOCK_PROMPT_SUFFIX)
-    ? prompt
-    : `${prompt}${CODEBLOCK_PROMPT_SUFFIX}`;
-}
-
 function wavPlaybackTimeoutMs(wavBuffer: Buffer): number | undefined {
   if (wavBuffer.length < 44 || wavBuffer.toString("ascii", 0, 4) !== "RIFF") {
     return undefined;
@@ -656,6 +509,7 @@ const DEFAULT_CONFIG: FullVoiceConfig = {
   port: 8181,
   remote: { ...DEFAULT_REMOTE_CONFIG },
   stt: { ...DEFAULT_STT_CONFIG },
+  speech: normalizeSpeechConfig(DEFAULT_SPEECH_CONFIG),
   events: {
     agent_end: {
       prompt: DEFAULT_SUMMARY_PROMPT,
@@ -680,6 +534,7 @@ function loadConfig(): FullVoiceConfig {
         port: raw.port ?? DEFAULT_CONFIG.port,
         remote: raw.remote ? { ...DEFAULT_REMOTE_CONFIG, ...raw.remote } : DEFAULT_CONFIG.remote,
         stt: raw.stt ? { ...DEFAULT_STT_CONFIG, ...raw.stt } : DEFAULT_CONFIG.stt,
+        speech: normalizeSpeechConfig(raw.speech),
         events: raw.events,
       };
       debugLog("config_loaded", {
@@ -700,36 +555,84 @@ function loadConfig(): FullVoiceConfig {
   return { ...DEFAULT_CONFIG };
 }
 
-function saveConfig(config: FullVoiceConfig) {
+function saveConfig(config: FullVoiceConfig, replace = false) {
   mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`);
+  let output: Record<string, unknown> = config as unknown as Record<string, unknown>;
+  if (!replace && existsSync(CONFIG_PATH)) {
+    try {
+      const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        output = {
+          ...raw,
+          enabled: config.enabled,
+          voice: config.voice,
+          speed: config.speed,
+        };
+      }
+    } catch {
+      /* replace malformed config with the normalized values */
+    }
+  }
+  writeFileSync(CONFIG_PATH, `${JSON.stringify(output, null, 2)}\n`);
 }
 
 // ── Context Extraction ────────────────────────────────────────────
 
-/**
- * Extract last_message content from event data.
- * Handles both single-message events (turn_end, message_end)
- * and multi-message events (agent_end).
- */
-// biome-ignore lint/suspicious/noExplicitAny: event shape varies by event type
-function extractLastMessage(event: any, mode: SpeechContentMode = "text"): string {
-  // agent_end has event.messages (array)
-  if (event.messages && Array.isArray(event.messages) && event.messages.length > 0) {
-    const lastMsg = event.messages[event.messages.length - 1];
-    return extractMessageContent(lastMsg?.content, mode);
-  }
-  // turn_end, message_end have event.message
-  return extractMessageContent(event.message?.content, mode);
+interface ExtractedMessage {
+  text: string;
+  role?: SpeechRole;
+  toolName?: string;
+  toolCallId?: string;
+  isError?: boolean;
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: content items have varying shapes
-function extractMessageContent(content: any[] | string | undefined, mode: SpeechContentMode): string {
+interface SpeechMessageLike {
+  role?: SpeechRole;
+  content?: unknown;
+  toolName?: string;
+  toolCallId?: string;
+  isError?: boolean;
+}
+
+function extractLastMessage(
+  event: unknown,
+  mode: SpeechContentMode = "text",
+  roles?: SpeechRole[],
+): ExtractedMessage {
+  const data = event as {
+    messages?: SpeechMessageLike[];
+    message?: SpeechMessageLike;
+    toolResults?: SpeechMessageLike[];
+  };
+  const messages = data.messages && Array.isArray(data.messages)
+    ? data.messages
+    : data.message
+      ? roles?.includes("toolResult") && Array.isArray(data.toolResults)
+        ? [data.message, ...data.toolResults]
+        : [data.message]
+      : [];
+  const message = roles?.length
+    ? [...messages].reverse().find((candidate) => roles.includes(candidate?.role))
+    : messages.at(-1);
+  if (!message) return { text: "" };
+  return {
+    text: extractMessageContent(message.content, mode),
+    role: message.role,
+    toolName: message.toolName,
+    toolCallId: message.toolCallId,
+    isError: message.isError,
+  };
+}
+
+function extractMessageContent(content: unknown, mode: SpeechContentMode): string {
   if (!content) return "";
   if (typeof content === "string") return mode === "thinking" ? "" : content;
+  if (!Array.isArray(content)) return "";
 
   return content
-    .map((c: any): string => {
+    .map((value: unknown): string => {
+      if (!value || typeof value !== "object") return "";
+      const c = value as { type?: string; text?: string; thinking?: string };
       if ((mode === "text" || mode === "all") && c.type === "text" && c.text) {
         return c.text;
       }
@@ -753,8 +656,10 @@ async function generateSpeechText(
   context: string,
   ctx: ExtensionContext,
   modelConfig?: ModelConfig,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   try {
+    if (signal?.aborted) throw abortSignalError(signal);
     const {
       AuthStorage,
       createAgentSession,
@@ -778,21 +683,46 @@ async function generateSpeechText(
       agentDir: resolve(homedir(), ".pi"),
       systemPromptOverride: () => prompt,
     });
-    await loader.reload();
+    await abortableSetup(loader.reload(), signal);
+    if (signal?.aborted) throw abortSignalError(signal);
 
-    const { session } = await createAgentSession({
-      model,
-      tools: [],
-      sessionManager: SessionManager.inMemory(),
-      authStorage: AuthStorage.create(),
-      modelRegistry: ctx.modelRegistry,
-      resourceLoader: loader,
-    });
+    const { session } = await abortableSetup(
+      createAgentSession({
+        model,
+        tools: [],
+        sessionManager: SessionManager.inMemory(),
+        authStorage: AuthStorage.create(),
+        modelRegistry: ctx.modelRegistry,
+        resourceLoader: loader,
+      }),
+      signal,
+      ({ session: lateSession }) => {
+        try {
+          void Promise.resolve(lateSession.abort())
+            .catch(() => {})
+            .finally(() => lateSession.dispose());
+        } catch {
+          lateSession.dispose();
+        }
+      },
+    );
 
+    let unsub: (() => void) | undefined;
+    const onAbort = () => {
+      void Promise.resolve(session.abort()).catch((error) => {
+        debugLog("summary_abort_error", { error: errorText(error) });
+      });
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     try {
+      if (signal?.aborted) {
+        onAbort();
+        throw abortSignalError(signal);
+      }
       let responseText = "";
 
-      const unsub = session.subscribe((event) => {
+      unsub = session.subscribe((event) => {
         if (event.type === "message_end" && event.message.role === "assistant") {
           for (const part of event.message.content) {
             if (part.type === "text" && part.text) {
@@ -803,14 +733,87 @@ async function generateSpeechText(
       });
 
       await session.prompt(userMessage);
-      unsub();
+      if (signal?.aborted) throw abortSignalError(signal);
 
       return responseText || null;
     } finally {
+      signal?.removeEventListener("abort", onAbort);
+      unsub?.();
       session.dispose();
     }
   } catch {
+    if (signal?.aborted) throw abortSignalError(signal);
     return null;
+  }
+}
+
+function abortSignalError(signal: AbortSignal): Error {
+  const error = new Error(
+    typeof signal.reason === "string" ? signal.reason : "Speech cancelled",
+  );
+  error.name = "AbortError";
+  return error;
+}
+
+function abortableSetup<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+  onLateResolve?: (value: T) => void,
+): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortSignalError(signal));
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      rejectPromise(abortSignalError(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        if (settled) {
+          try {
+            onLateResolve?.(value);
+          } catch {
+            /* late cleanup is best effort */
+          }
+          return;
+        }
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolvePromise(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        rejectPromise(error);
+      },
+    );
+  });
+}
+
+function parseCodeSummaries(value: string | null): Record<number, string> {
+  if (!value) return {};
+  const candidate = value
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    if (!Array.isArray(parsed)) return {};
+    const entries = parsed.flatMap((item): Array<[number, string]> => {
+      if (!item || typeof item !== "object") return [];
+      const id = (item as { id?: unknown }).id;
+      const summary = (item as { summary?: unknown }).summary;
+      return typeof id === "number" && Number.isInteger(id) && typeof summary === "string"
+        ? [[id, summary.trim()]]
+        : [];
+    });
+    return Object.fromEntries(entries.filter(([, summary]) => summary));
+  } catch {
+    return {};
   }
 }
 
@@ -818,13 +821,18 @@ async function generateSpeechText(
 
 export default function (pi: ExtensionAPI) {
   let defaults = loadConfig();
+  let pronunciations: PronunciationFile = { version: 1, rules: [] };
   let session: VoiceSessionState = {};
   let currentCtx: ExtensionContext | undefined;
   let lastVoiceStatus = "idle";
   let sttStatus = "ready";
   let streamBuffer = "";
-  let streamTail: Promise<void> = Promise.resolve();
   let streamJobCounter = 0;
+  let nextSpeechGeneration = 0;
+  let activeSpeechGeneration = 0;
+  let waitingForUserMessage = false;
+  const pendingUserGenerations: Array<{ generation: number; text: string }> = [];
+  const toolCalls = new Map<string, { name: string; args: Record<string, unknown> }>();
 
   function getEffective(): FullVoiceConfig {
     return {
@@ -836,6 +844,7 @@ export default function (pi: ExtensionAPI) {
       port: defaults.port,
       remote: defaults.remote,
       stt: defaults.stt,
+      speech: defaults.speech,
       events: defaults.events,
     };
   }
@@ -874,6 +883,20 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry<VoiceSessionState>("voice-session", { ...session });
   }
 
+  function reloadRuntimeConfig(): void {
+    defaults = loadConfig();
+    const result = loadPronunciations(CONFIG_DIR, defaults.speech, pronunciations);
+    pronunciations = result.file;
+    if (result.error) {
+      debugLog("pronunciations_load_error", { path: result.path, error: result.error });
+    } else {
+      debugLog("pronunciations_loaded", {
+        path: result.path,
+        rules: pronunciations.rules.length,
+      });
+    }
+  }
+
   function restoreSession(ctx: ExtensionContext) {
     const branch = ctx.sessionManager.getBranch();
     for (const entry of branch) {
@@ -882,48 +905,15 @@ export default function (pi: ExtensionAPI) {
         if (data) session = { ...data };
       }
     }
-    defaults = loadConfig();
+    reloadRuntimeConfig();
   }
 
-  // ── Audio playback queue ────────────────────────────────────────
+  // ── Speech scheduler ────────────────────────────────────────────
 
-  // Serializes audio playback so tts tool and auto-TTS never overlap.
-  type QueueItem = {
-    play: () => Promise<unknown>;
-    resolve: (value: unknown) => void;
-    reject: (error: unknown) => void;
-  };
-
-  const audioQueue: QueueItem[] = [];
-  let audioPlaying = false;
+  const speechScheduler = new SpeechScheduler<void>();
   let audioFileCounter = 0;
-  let autoTTSTail: Promise<void> = Promise.resolve();
+  let ttsRequestCounter = 0;
   let autoTTSJobCounter = 0;
-
-  function drainAudioQueue(): void {
-    if (audioPlaying) return;
-    const item = audioQueue.shift();
-    if (!item) return;
-    audioPlaying = true;
-    item
-      .play()
-      .then(item.resolve, item.reject)
-      .finally(() => {
-        audioPlaying = false;
-        drainAudioQueue();
-      });
-  }
-
-  function enqueueAudio<T>(play: () => Promise<T>): Promise<T> {
-    return new Promise((resolve, reject) => {
-      audioQueue.push({
-        play,
-        resolve: (value: unknown) => resolve(value as T),
-        reject,
-      });
-      drainAudioQueue();
-    });
-  }
 
   function playSttCue(kind: "start" | "finish", config: SttRuntimeConfig): Promise<void> {
     if (!config.audioCues) return Promise.resolve();
@@ -1147,11 +1137,31 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function fetchTtsWav(text: string, config: FullVoiceConfig): Promise<Buffer> {
+  function abortError(signal?: AbortSignal): Error {
+    const error = new Error(
+      typeof signal?.reason === "string" ? signal.reason : "Speech cancelled",
+    );
+    error.name = "AbortError";
+    return error;
+  }
+
+  function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw abortError(signal);
+  }
+
+  async function fetchTtsWav(
+    text: string,
+    config: FullVoiceConfig,
+    signal?: AbortSignal,
+  ): Promise<Buffer> {
+    throwIfAborted(signal);
     const remote = config.backend === "remote" ? remoteConfig(config) : null;
     const url = remote
       ? remoteUrl(config, remote.speechPath)
       : `http://${config.host}:${config.port}/tts`;
+    const requestId = remote
+      ? undefined
+      : `${process.pid}-${Date.now()}-${++ttsRequestCounter}`;
     const body = remote
       ? {
           model: "kokoro",
@@ -1164,6 +1174,7 @@ export default function (pi: ExtensionAPI) {
           text,
           voice: config.voice,
           speed: config.speed,
+          requestId,
         };
 
     debugLog("tts_wav_request", {
@@ -1174,27 +1185,48 @@ export default function (pi: ExtensionAPI) {
       speed: config.speed,
       preview: textPreview(text),
     });
-    const res = await fetch(url, {
-      method: "POST",
-      headers: remote ? remoteJsonHeaders(remote) : { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const onAbort = () => {
+      if (!requestId) return;
+      void fetch(`http://${config.host}:${config.port}/tts/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requestId }),
+      }).catch((error) => {
+        debugLog("tts_cancel_error", { requestId, error: errorText(error) });
+      });
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: remote ? remoteJsonHeaders(remote) : { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
 
-    debugLog("tts_wav_response", {
-      url,
-      status: res.status,
-      ok: res.ok,
-      contentType: res.headers.get("content-type"),
-      contentLength: res.headers.get("content-length"),
-    });
-    if (!res.ok) throw new Error(await responseError(res));
-    setVoiceStatus(`${config.backend} audio ready`);
-    const wav = Buffer.from(await res.arrayBuffer());
-    debugLog("tts_wav_buffer", { bytes: wav.length });
-    return wav;
+      debugLog("tts_wav_response", {
+        url,
+        status: res.status,
+        ok: res.ok,
+        contentType: res.headers.get("content-type"),
+        contentLength: res.headers.get("content-length"),
+      });
+      if (!res.ok) throw new Error(await responseError(res));
+      setVoiceStatus(`${config.backend} audio ready`);
+      const wav = Buffer.from(await res.arrayBuffer());
+      throwIfAborted(signal);
+      debugLog("tts_wav_buffer", { bytes: wav.length });
+      return wav;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
   }
 
-  async function playWavBuffer(wavBuffer: Buffer): Promise<string | undefined> {
+  async function playWavBuffer(
+    wavBuffer: Buffer,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    throwIfAborted(signal);
     const outPath = join(
       CONFIG_DIR,
       `voice-${Date.now()}-${process.pid}-${++audioFileCounter}.wav`,
@@ -1209,27 +1241,68 @@ export default function (pi: ExtensionAPI) {
       command: process.platform === "darwin" ? "afplay" : "aplay",
     });
 
-    return await enqueueAudio(
-      () =>
-        new Promise<string | undefined>((resolve) => {
-          const cmd = process.platform === "darwin" ? "afplay" : "aplay";
-          execCb(`${cmd} "${outPath}"`, { timeout: playbackTimeout }, (err) => {
-            try {
-              unlinkSync(outPath);
-            } catch {
-              /* ignore */
-            }
-            debugLog("wav_play_end", { path: outPath, error: err?.message });
-            resolve(err?.message);
-          });
-        }),
-    );
+    return await new Promise<string | undefined>((resolve, reject) => {
+      const cmd = process.platform === "darwin" ? "afplay" : "aplay";
+      const child = spawn(cmd, [outPath], { stdio: "ignore" });
+      let settled = false;
+      let timeout: NodeJS.Timeout | undefined;
+      let killTimeout: NodeJS.Timeout | undefined;
+      let terminationError: string | undefined;
+
+      const cleanup = () => {
+        signal?.removeEventListener("abort", onAbort);
+        if (timeout) clearTimeout(timeout);
+        if (killTimeout) clearTimeout(killTimeout);
+        try {
+          unlinkSync(outPath);
+        } catch {
+          /* ignore */
+        }
+      };
+      const finish = (error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        const message = error ? errorText(error) : undefined;
+        debugLog("wav_play_end", { path: outPath, error: message });
+        if (signal?.aborted) reject(abortError(signal));
+        else resolve(message);
+      };
+      const terminate = (message?: string) => {
+        terminationError ??= message;
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        child.kill("SIGTERM");
+        killTimeout ??= setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        }, 1000);
+      };
+      const onAbort = () => terminate();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      child.on("error", (error) => {
+        terminationError = error.message;
+        terminate(error.message);
+      });
+      child.on("close", (code, childSignal) => {
+        finish(
+          terminationError ??
+            (code === 0 ? undefined : `${cmd} exited with ${childSignal ?? `code ${code}`}`),
+        );
+      });
+      if (playbackTimeout) {
+        timeout = setTimeout(() => {
+          terminate(`${cmd} playback timed out`);
+        }, playbackTimeout);
+      }
+      if (signal?.aborted) onAbort();
+    });
   }
 
   async function playRemotePcmStream(
     speechText: string,
     config: FullVoiceConfig,
+    signal?: AbortSignal,
   ): Promise<string | undefined> {
+    throwIfAborted(signal);
     const player = streamingPcmPlayer();
     if (!player) throw new Error("No streaming PCM player found");
 
@@ -1255,6 +1328,7 @@ export default function (pi: ExtensionAPI) {
         stream_format: "pcm",
         speed: config.speed,
       }),
+      signal,
     });
 
     debugLog("pcm_stream_response", {
@@ -1269,12 +1343,37 @@ export default function (pi: ExtensionAPI) {
     if (!res.body) throw new Error("Remote TTS stream response had no body");
     setVoiceStatus("remote stream connected");
 
-    return await enqueueAudio(
-      () =>
-        new Promise<string | undefined>((resolve) => {
+    return await new Promise<string | undefined>((resolve, reject) => {
           const child = spawn(player.command, player.args, { stdio: ["pipe", "ignore", "pipe"] });
           let error: string | undefined;
           let bytes = 0;
+          let settled = false;
+          let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+          let killTimeout: NodeJS.Timeout | undefined;
+          const terminate = () => {
+            if (child.exitCode !== null || child.signalCode !== null) return;
+            child.kill("SIGTERM");
+            killTimeout ??= setTimeout(() => {
+              if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+            }, 1000);
+          };
+          const finish = (code: number | null) => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener("abort", onAbort);
+            if (killTimeout) clearTimeout(killTimeout);
+            void reader?.cancel().catch(() => {});
+            child.stdin.destroy();
+            debugLog("pcm_player_close", { code, error, bytes });
+            if (signal?.aborted) reject(abortError(signal));
+            else resolve(code === 0 ? undefined : (error ?? `${player.command} exited with code ${code}`));
+          };
+          const onAbort = () => {
+            void reader?.cancel(signal?.reason).catch(() => {});
+            child.stdin.destroy();
+            terminate();
+          };
+          signal?.addEventListener("abort", onAbort, { once: true });
           debugLog("pcm_player_start", {
             command: player.command,
             args: player.args,
@@ -1284,6 +1383,7 @@ export default function (pi: ExtensionAPI) {
           child.on("error", (err) => {
             error = err.message;
             debugLog("pcm_player_error", { error: err.message });
+            terminate();
           });
           child.stdin.on("error", (err) => {
             error = err.message;
@@ -1297,12 +1397,11 @@ export default function (pi: ExtensionAPI) {
             }
           });
           child.on("close", (code) => {
-            debugLog("pcm_player_close", { code, error, bytes });
-            resolve(code === 0 ? undefined : (error ?? `${player.command} exited with code ${code}`));
+            finish(code);
           });
 
           (async () => {
-            const reader = res.body?.getReader();
+            reader = res.body?.getReader();
             if (!reader) throw new Error("Remote TTS stream response had no reader");
             try {
               while (true) {
@@ -1317,60 +1416,71 @@ export default function (pi: ExtensionAPI) {
               child.stdin.end();
               debugLog("pcm_stream_read_done", { bytes });
             } catch (err) {
+              if (signal?.aborted) return;
               error = errorText(err);
               debugLog("pcm_stream_read_error", { error, bytes });
               child.stdin.destroy();
-              child.kill();
+              terminate();
             }
-          })();
-        }),
-    );
+          })().catch((err) => {
+            error = errorText(err);
+            child.stdin.destroy();
+            terminate();
+          });
+          if (signal?.aborted) onAbort();
+        });
   }
 
   async function synthesizeAndPlay(
     speechText: string,
     config: FullVoiceConfig,
+    signal?: AbortSignal,
   ): Promise<string | undefined> {
+    throwIfAborted(signal);
     if (config.backend !== "remote") {
-      return await playWavBuffer(await fetchTtsWav(speechText, config));
+      return await playWavBuffer(await fetchTtsWav(speechText, config, signal), signal);
     }
 
     const remote = remoteConfig(config);
     if (remote.stream && remote.streamFormat === "pcm" && streamingPcmPlayer()) {
       try {
-        return await playRemotePcmStream(speechText, config);
+        return await playRemotePcmStream(speechText, config, signal);
       } catch (error) {
+        throwIfAborted(signal);
         debugLog("remote_stream_fallback", { error: errorText(error) });
         setVoiceStatus("remote stream failed; chunk fallback");
       }
     }
 
     const chunks = remote.chunkText ? splitSpeechText(speechText, remote.chunkMaxChars) : [speechText];
-    const playbacks: Array<Promise<string | undefined>> = [];
-    try {
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        setVoiceStatus(`remote chunk ${i + 1}/${chunks.length}`);
-        const wavBuffer = await fetchTtsWav(chunk, config);
-        playbacks.push(playWavBuffer(wavBuffer));
-      }
-    } catch (error) {
-      debugLog("chunked_wav_error", { error: errorText(error), queuedPlaybacks: playbacks.length });
-      await Promise.allSettled(playbacks);
-      throw error;
+    for (let i = 0; i < chunks.length; i++) {
+      throwIfAborted(signal);
+      const chunk = chunks[i];
+      setVoiceStatus(`remote chunk ${i + 1}/${chunks.length}`);
+      const wavBuffer = await fetchTtsWav(chunk, config, signal);
+      const playbackError = await playWavBuffer(wavBuffer, signal);
+      if (playbackError) return playbackError;
     }
-    const errors = await Promise.all(playbacks);
-    return errors.find(Boolean);
+    return undefined;
   }
 
-  // Queued speak — fetches TTS audio and enqueues it for sequential playback.
-  async function speak(
-    text: string,
+  function cancellationReasonText(reason: SpeechCancellationReason | unknown): string {
+    if (!reason || typeof reason !== "object" || !("type" in reason)) return "cancelled";
+    if (reason.type === "stale-generation") return "new-user-input";
+    if (reason.type === "cancel-all" && "detail" in reason && reason.detail) {
+      return String(reason.detail);
+    }
+    return String(reason.type);
+  }
+
+  async function speakPrepared(
+    speechText: string,
     config: FullVoiceConfig,
     source: VoiceSpeakSource,
+    signal: AbortSignal,
   ): Promise<void> {
-    const speechText = prepareTextForSpeech(text);
     if (!speechText) return;
+    throwIfAborted(signal);
 
     const startEvent: VoiceSpeakStartEvent = {
       text: speechText,
@@ -1390,7 +1500,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     try {
-      const playbackError = await synthesizeAndPlay(speechText, config);
+      const playbackError = await synthesizeAndPlay(speechText, config, signal);
       const endEvent: VoiceSpeakEndEvent = {
         text: speechText,
         source,
@@ -1400,97 +1510,224 @@ export default function (pi: ExtensionAPI) {
       debugLog("speak_end", { source, error: playbackError });
       setVoiceStatus(playbackError ? "playback error" : "idle");
     } catch (error) {
-      debugLog("speak_error", { source, error: errorText(error) });
-      setVoiceStatus("tts error");
+      const cancelled = signal.aborted || (error instanceof Error && error.name === "AbortError");
+      const cancellationReason = cancelled ? cancellationReasonText(signal.reason) : undefined;
+      debugLog(cancelled ? "speak_cancelled" : "speak_error", {
+        source,
+        error: errorText(error),
+        cancellationReason,
+      });
+      setVoiceStatus(cancelled ? "cancelled" : "tts error");
       const endEvent: VoiceSpeakEndEvent = {
         text: speechText,
         source,
-        error: error instanceof Error ? error.message : String(error),
+        ...(cancelled
+          ? { cancelled: true, cancellationReason }
+          : { error: error instanceof Error ? error.message : String(error) }),
       };
       pi.events.emit("voice:speak_end", endEvent);
+      throw error;
     }
+  }
+
+  function enqueueSpeech(
+    source: VoiceSpeakSource,
+    generation: number,
+    cancellable: boolean,
+    run: (signal: AbortSignal) => Promise<void>,
+  ) {
+    const result = speechScheduler.enqueue({ source, generation, cancellable, run });
+    void result.then((outcome) => {
+        if (outcome.status === "failed") {
+          debugLog("speech_job_failed", {
+            id: outcome.id,
+            source,
+            generation,
+            error: errorText(outcome.error),
+          });
+        }
+      });
+    return result;
+  }
+
+  async function prepareConfiguredSpeech(
+    input: string,
+    eventName: string,
+    eventConfig: EventConfig,
+    extracted: ExtractedMessage,
+    ctx: ExtensionContext,
+    profile: SpeechProfileConfig,
+    toolArgs: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const speechContext: SpeechContext = {
+      source: "auto",
+      event: eventName,
+      role: extracted.role,
+      tool: extracted.toolName,
+    };
+
+    if ("prompt" in eventConfig) {
+      const generated = await generateSpeechText(
+        eventConfig.prompt,
+        input,
+        ctx,
+        eventConfig.model,
+        signal,
+      );
+      return generated
+        ? prepareSpeechText(generated, {
+            context: { ...speechContext, role: "assistant", tool: undefined },
+            profile,
+            pronunciations,
+          })
+        : "";
+    }
+
+    let toolSummary: string | undefined;
+    if (extracted.toolName && shouldSummarizeToolOutput(input, profile)) {
+      setVoiceStatus(`summarizing ${extracted.toolName} output`);
+      toolSummary =
+        (await generateSpeechText(
+          TECHNICAL_TOOL_SUMMARY_PROMPT,
+          JSON.stringify({
+            tool: extracted.toolName,
+            args: toolArgs,
+            isError: extracted.isError ?? false,
+            output: input,
+          }),
+          ctx,
+          undefined,
+          signal,
+        )) ?? undefined;
+    }
+
+    const targets = extracted.toolName ? [] : codeSummaryTargets(input, profile);
+    let codeSummaries: Record<number, string> = {};
+    if (targets.length > 0) {
+      setVoiceStatus(`summarizing ${targets.length} code block${targets.length === 1 ? "" : "s"}`);
+      codeSummaries = parseCodeSummaries(
+        await generateSpeechText(
+          TECHNICAL_CODE_SUMMARY_PROMPT,
+          JSON.stringify(targets),
+          ctx,
+          undefined,
+          signal,
+        ),
+      );
+    }
+
+    return prepareSpeechText(input, {
+      context: speechContext,
+      profile,
+      pronunciations,
+      toolArgs,
+      isError: extracted.isError,
+      codeSummaries,
+      toolSummary,
+    });
   }
 
   async function handleAutoTTS(
     eventName: string,
-    // biome-ignore lint/suspicious/noExplicitAny: event shape varies by event type
-    event: any,
     ctx: ExtensionContext,
     config: FullVoiceConfig,
     jobId: number,
+    signal: AbortSignal,
+    extracted?: ExtractedMessage,
+    toolArgs: Record<string, unknown> = {},
   ): Promise<void> {
-    try {
-      if (!config.enabled) return;
-      if (!config.events?.[eventName]) return;
-      if (eventName === "agent_end" && config.events.message_update) return;
-      // model is optional per-event — falls back to ctx.model
+    if (!config.enabled) return;
+    if (!config.events?.[eventName]) return;
+    if (eventName === "agent_end" && config.events.message_update) return;
+    throwIfAborted(signal);
 
-      const eventConfig = config.events[eventName];
-
-      // Direct text — speak immediately, no LLM
-      if ("text" in eventConfig) {
-        const text = prepareTextForSpeech(eventConfig.text);
-        if (!text) return;
-        setVoiceStatus(`auto #${jobId} fixed ${eventName}`);
-        await speak(text, config, "auto");
-        return;
-      }
-
-      // Extract configured event content. If a prompt is configured, summarize it via LLM.
-      // If no prompt is configured, speak the extracted content exactly as written.
-      const context = extractLastMessage(event, eventConfig.content ?? "text");
-      if (!context) return;
-
-      if ("prompt" in eventConfig) {
-        setVoiceStatus(`auto #${jobId} summarizing ${eventName}`);
-        const generated = await generateSpeechText(
-          withCodeblockInstructions(eventConfig.prompt),
-          context,
-          ctx,
-          eventConfig.model,
-        );
-        const text = generated ? prepareTextForSpeech(generated) : null;
-        if (!text) return;
-        await speak(text, config, "auto");
-        return;
-      }
-
-      if (containsFencedCodeBlock(context)) {
-        setVoiceStatus(`auto #${jobId} code summary ${eventName}`);
-        const generated = await generateSpeechText(CODEBLOCK_SPEECH_PROMPT, context, ctx);
-        const text = generated ? prepareTextForSpeech(generated) : prepareTextForSpeech(context);
-        if (!text) return;
-        await speak(text, config, "auto");
-        return;
-      }
-
-      const text = prepareTextForSpeech(context);
-      if (!text) return;
-      setVoiceStatus(`auto #${jobId} speaking ${eventName}`);
-      await speak(text, config, "auto");
-    } catch (error) {
-      setVoiceStatus("auto error");
+    const eventConfig = config.events[eventName];
+    const profile = resolveConfiguredProfile(config.speech, eventConfig.profile);
+    if ("text" in eventConfig) {
+      const speechText = prepareSpeechText(eventConfig.text, {
+        context: { source: "auto", event: eventName },
+        profile,
+        pronunciations,
+      });
+      if (!speechText) return;
+      setVoiceStatus(`auto #${jobId} fixed ${eventName}`);
+      await speakPrepared(speechText, config, "auto", signal);
+      return;
     }
+
+    if (!extracted?.text) return;
+    setVoiceStatus(`auto #${jobId} preparing ${eventName}`);
+    const speechText = await prepareConfiguredSpeech(
+      extracted.text,
+      eventName,
+      eventConfig,
+      extracted,
+      ctx,
+      profile,
+      toolArgs,
+      signal,
+    );
+    if (!speechText) return;
+    await speakPrepared(speechText, config, "auto", signal);
   }
 
   function enqueueAutoTTS(
     eventName: string,
-    // biome-ignore lint/suspicious/noExplicitAny: event shape varies by event type
-    event: any,
+    event: unknown,
     ctx: ExtensionContext,
     config: FullVoiceConfig,
   ): void {
+    const eventConfig = config.events?.[eventName];
+    const extracted = eventConfig && !("text" in eventConfig)
+      ? extractLastMessage(event, eventConfig.content ?? "text", eventConfig.roles)
+      : undefined;
+    const toolArgs = extracted?.toolCallId
+      ? { ...(toolCalls.get(extracted.toolCallId)?.args ?? {}) }
+      : {};
+
+    if (eventName === "turn_end") {
+      const turn = event as { toolResults?: Array<{ toolCallId?: string }> };
+      for (const result of turn.toolResults ?? []) {
+        if (result.toolCallId) toolCalls.delete(result.toolCallId);
+      }
+    } else if (eventName === "agent_end") {
+      toolCalls.clear();
+    }
+
+    if (!config.enabled || waitingForUserMessage || !eventConfig) return;
+    if (eventName === "agent_end" && config.events?.message_update) return;
     const jobId = ++autoTTSJobCounter;
-    autoTTSTail = autoTTSTail
-      .then(() => {
-        if (eventName !== "message_end") return undefined;
-        flushStreamingAutoTTS(config, true);
-        return streamTail;
-      })
-      .then(() => handleAutoTTS(eventName, event, ctx, config, jobId))
-      .catch(() => {
-        setVoiceStatus(`auto #${jobId} queue error`);
-      });
+    if (eventName === "message_end") flushStreamingAutoTTS(config, true);
+    const generation = activeSpeechGeneration;
+    enqueueSpeech("auto", generation, true, async (signal) => {
+      await handleAutoTTS(eventName, ctx, config, jobId, signal, extracted, toolArgs);
+    });
+  }
+
+  function firstCodeFenceSpan(value: string): { start: number; end?: number } | null {
+    const lines = value.match(/[^\n]*(?:\n|$)/g) ?? [];
+    let offset = 0;
+    let open: { start: number; character: string; length: number } | undefined;
+    for (const lineWithEnding of lines) {
+      if (!lineWithEnding) continue;
+      const line = lineWithEnding.endsWith("\n")
+        ? lineWithEnding.slice(0, -1).replace(/\r$/, "")
+        : lineWithEnding;
+      if (!open) {
+        const opening = line.match(/^[ \t]{0,3}(`{3,}|~{3,})/)?.[1];
+        if (opening) {
+          open = { start: offset, character: opening[0], length: opening.length };
+        }
+      } else {
+        const closing = line.match(/^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$/)?.[1];
+        if (closing?.[0] === open.character && closing.length >= open.length) {
+          return { start: open.start, end: offset + lineWithEnding.length };
+        }
+      }
+      offset += lineWithEnding.length;
+    }
+    return open ? { start: open.start } : null;
   }
 
   function nextStreamingChunk(force: boolean, maxChars: number): string | null {
@@ -1498,15 +1735,24 @@ export default function (pi: ExtensionAPI) {
     streamBuffer = text;
     if (!streamBuffer) return null;
 
-    if (force) {
-      const chunk = streamBuffer;
-      streamBuffer = "";
-      return chunk;
+    const fence = firstCodeFenceSpan(streamBuffer);
+    if (fence?.start === 0) {
+      if (fence.end === undefined && !force) return null;
+      const end = fence.end ?? streamBuffer.length;
+      const chunk = streamBuffer.slice(0, end).trim();
+      streamBuffer = streamBuffer.slice(end).trimStart();
+      return chunk || null;
     }
 
+    const availableEnd = fence?.start ?? streamBuffer.length;
+    const available = streamBuffer.slice(0, availableEnd);
+    const mustEmitBeforeFence = !!fence;
+
     const minChunk = Math.min(120, Math.max(60, Math.floor(maxChars / 2)));
-    const punctuationMatches = [...streamBuffer.matchAll(/[.!?;:]\s+/g)];
-    const lastBoundary = punctuationMatches.at(-1);
+    const punctuationMatches = [...available.matchAll(/[.!?;:]\s+/g)];
+    const lastBoundary = punctuationMatches
+      .filter((match) => (match.index ?? 0) + match[0].length <= maxChars)
+      .at(-1);
     if (lastBoundary?.index !== undefined) {
       const end = lastBoundary.index + lastBoundary[0].length;
       if (end >= minChunk) {
@@ -1516,10 +1762,15 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    if (streamBuffer.length < maxChars) return null;
-    const end = streamBuffer.lastIndexOf(" ", maxChars);
-    const cut = end >= minChunk ? end : maxChars;
-    const chunk = streamBuffer.slice(0, cut).trim();
+    if (!force && !mustEmitBeforeFence && available.length < maxChars) return null;
+    const maximum = Math.min(maxChars, available.length);
+    const end = available.lastIndexOf(" ", maximum);
+    const cut = mustEmitBeforeFence && available.length <= maxChars
+      ? available.length
+      : end >= minChunk
+        ? end
+        : maximum;
+    const chunk = available.slice(0, cut).trim();
     streamBuffer = streamBuffer.slice(cut).trimStart();
     return chunk;
   }
@@ -1536,16 +1787,22 @@ export default function (pi: ExtensionAPI) {
     }
     if (chunks.length === 0) return;
 
-    streamTail = streamTail
-      .then(async () => {
-        for (const chunk of chunks) {
-          setVoiceStatus(`stream #${jobId} ${chunk.length} chars`);
-          await speak(chunk, config, "auto");
-        }
-      })
-      .catch(() => {
-        setVoiceStatus(`stream #${jobId} error`);
+    const eventConfig = config.events?.message_update;
+    if (!eventConfig || "prompt" in eventConfig || "text" in eventConfig) return;
+    const profile = resolveConfiguredProfile(config.speech, eventConfig.profile);
+    const generation = activeSpeechGeneration;
+    for (const chunk of chunks) {
+      enqueueSpeech("auto", generation, true, async (signal) => {
+        const speechText = prepareSpeechText(chunk, {
+          context: { source: "auto", event: "message_update", role: "assistant" },
+          profile,
+          pronunciations,
+        });
+        if (!speechText) return;
+        setVoiceStatus(`stream #${jobId} ${speechText.length} chars`);
+        await speakPrepared(speechText, config, "auto", signal);
       });
+    }
   }
 
   function handleMessageUpdateTTS(
@@ -1553,9 +1810,10 @@ export default function (pi: ExtensionAPI) {
     event: any,
     config: FullVoiceConfig,
   ): void {
-    if (!config.enabled) return;
+    if (!config.enabled || waitingForUserMessage) return;
     const eventConfig = config.events?.message_update;
     if (!eventConfig || "prompt" in eventConfig || "text" in eventConfig) return;
+    if (eventConfig.roles?.length && !eventConfig.roles.includes("assistant")) return;
 
     const mode = eventConfig.content ?? "text";
     const update = event.assistantMessageEvent;
@@ -1658,27 +1916,18 @@ export default function (pi: ExtensionAPI) {
           const voice = voices.length > 0 ? voices[voiceIdx] : defaults.voice;
           const speed = Number.parseFloat(SPEED_VALUES[speedIdx]);
           const sampleConfig = { ...effective, voice, speed };
-          pi.events.emit("voice:speak_start", {
-            text: sampleText,
-            voice,
-            speed,
-            source: "sample",
+          const speechText = prepareSpeechText(sampleText, {
+            context: { source: "sample" },
+            profile: resolveConfiguredProfile(sampleConfig.speech),
+            pronunciations,
           });
-          try {
-            const playbackError = await synthesizeAndPlay(sampleText, sampleConfig);
-            pi.events.emit("voice:speak_end", {
-              text: sampleText,
-              source: "sample",
-              ...(playbackError ? { error: playbackError } : {}),
-            });
-          } catch (error) {
-            pi.events.emit("voice:speak_end", {
-              text: sampleText,
-              source: "sample",
-              error: error instanceof Error ? error.message : String(error),
-            });
-            throw error;
-          }
+          const result = await enqueueSpeech(
+            "sample",
+            activeSpeechGeneration,
+            false,
+            async (signal) => speakPrepared(speechText, sampleConfig, "sample", signal),
+          );
+          if (result.status === "failed") throw result.error;
         }
 
         return {
@@ -1792,8 +2041,8 @@ export default function (pi: ExtensionAPI) {
             if (matchesKey(data, "r")) {
               session = {};
               // Write full defaults (including agent_end event) back to disk
-              saveConfig({ ...DEFAULT_CONFIG });
-              defaults = loadConfig();
+              saveConfig({ ...DEFAULT_CONFIG }, true);
+              reloadRuntimeConfig();
               persistSession();
               enabled = defaults.enabled;
               voiceIdx = voices.length > 0 ? Math.max(0, voices.indexOf(defaults.voice)) : -1;
@@ -1861,7 +2110,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("voice-debug", {
     description: "Show pi-voice runtime config and backend status",
     handler: async (_args, ctx) => {
-      defaults = loadConfig();
+      reloadRuntimeConfig();
       const effective = getEffective();
       const health = await fetchHealth(effective);
       const remote = remoteConfig(effective);
@@ -1899,6 +2148,10 @@ export default function (pi: ExtensionAPI) {
               `stt language: ${stt.language ?? "auto"}`,
               `stt audio cues: ${stt.audioCues ? "enabled" : "disabled"}`,
               `events: ${events.length ? events.join(", ") : "none"}`,
+              `queue on user input: ${effective.speech?.queue.onUserInput ?? "continue"}`,
+              `speech profile: ${effective.speech?.processing.defaultProfile ?? "technical"}`,
+              `pronunciation rules: ${pronunciations.rules.length}`,
+              `speech jobs: ${speechScheduler.active ? "1 active" : "idle"}, ${speechScheduler.queued.length} queued`,
               `footer status: ${statusLine(effective)}`,
               "",
               `health: ${health ? `${health.status} modelLoaded=${health.modelLoaded} active=${health.activeDtype}` : "offline"}`,
@@ -1916,6 +2169,19 @@ export default function (pi: ExtensionAPI) {
           },
         }),
         { overlay: true },
+      );
+    },
+  });
+
+  pi.registerCommand("voice-reload", {
+    description: "Reload pi-voice config and pronunciation rules",
+    handler: async (_args, ctx) => {
+      reloadRuntimeConfig();
+      registerCustomEvents();
+      updateStatusBar();
+      ctx.ui.notify(
+        `Voice config reloaded (${pronunciations.rules.length} pronunciation rules)`,
+        "info",
       );
     },
   });
@@ -1991,11 +2257,26 @@ export default function (pi: ExtensionAPI) {
           details: {},
         };
       }
+      if (waitingForUserMessage) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Speech skipped because newer user input is waiting to be processed.",
+            },
+          ],
+          details: { cancelled: true },
+        };
+      }
 
       const ttsParams = params as { text: string; voice?: string; speed?: number };
       const voice = ttsParams.voice ?? effective.voice;
       const speed = ttsParams.speed ?? effective.speed;
-      const speechText = prepareTextForSpeech(ttsParams.text);
+      const speechText = prepareSpeechText(ttsParams.text, {
+        context: { source: "tool", role: "assistant" },
+        profile: resolveConfiguredProfile(effective.speech),
+        pronunciations,
+      });
 
       if (!speechText) {
         return {
@@ -2004,8 +2285,15 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      speak(speechText, { ...effective, voice, speed }, "tool").catch(() => {
-        /* errors already logged inside speak */
+      const generation = activeSpeechGeneration;
+      enqueueSpeech("tool", generation, true, async (signal) => {
+        const combinedSignal = _signal ? AbortSignal.any([signal, _signal]) : signal;
+        await speakPrepared(
+          speechText,
+          { ...effective, voice, speed },
+          "tool",
+          combinedSignal,
+        );
       });
 
       const preview = speechText.length > 80 ? `${speechText.slice(0, 80)}…` : speechText;
@@ -2031,13 +2319,75 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     restoreSession(ctx);
+    registerCustomEvents();
     updateStatusBar();
   });
 
   pi.on("session_tree", async (_event, ctx) => {
+    speechScheduler.cancelAll("session-tree");
+    await speechScheduler.whenIdle();
+    streamBuffer = "";
+    waitingForUserMessage = false;
+    pendingUserGenerations.length = 0;
+    toolCalls.clear();
     currentCtx = ctx;
     restoreSession(ctx);
+    registerCustomEvents();
     updateStatusBar();
+  });
+
+  pi.on("session_shutdown", async () => {
+    speechScheduler.cancelAll("session-shutdown");
+    await speechScheduler.whenIdle();
+    streamBuffer = "";
+    toolCalls.clear();
+    for (const unsub of customUnsubs) unsub();
+    customUnsubs.length = 0;
+  });
+
+  pi.on("input", async (event) => {
+    const speech = getEffective().speech ?? DEFAULT_SPEECH_CONFIG;
+    if (!speech.queue.inputSources.includes(event.source)) return { action: "continue" as const };
+    if (event.streamingBehavior === undefined && pendingUserGenerations.length > 0) {
+      pendingUserGenerations.length = 0;
+    }
+    const generation = ++nextSpeechGeneration;
+    pendingUserGenerations.push({ generation, text: event.text.trim() });
+    waitingForUserMessage = speech.queue.onUserInput !== "continue";
+    streamBuffer = "";
+    const cancelled = speechScheduler.cancelBeforeGeneration(
+      generation,
+      speech.queue.onUserInput,
+    );
+    debugLog("user_input_speech_policy", {
+      source: event.source,
+      policy: speech.queue.onUserInput,
+      generation,
+      cancelled,
+    });
+    return { action: "continue" as const };
+  });
+
+  pi.on("message_start", async (event) => {
+    if (event.message.role !== "user") return;
+    const messageText = extractMessageContent(event.message.content, "text").trim();
+    const matchingIndex = pendingUserGenerations.findIndex(
+      (pending) => pending.text === messageText,
+    );
+    const consumedIndex = matchingIndex >= 0 ? matchingIndex : 0;
+    const consumed = pendingUserGenerations[consumedIndex];
+    if (consumed) pendingUserGenerations.splice(0, consumedIndex + 1);
+    activeSpeechGeneration = consumed?.generation ?? ++nextSpeechGeneration;
+    const speech = getEffective().speech ?? DEFAULT_SPEECH_CONFIG;
+    waitingForUserMessage =
+      speech.queue.onUserInput !== "continue" && pendingUserGenerations.length > 0;
+  });
+
+  pi.on("tool_execution_start", async (event) => {
+    toolCalls.set(event.toolCallId, {
+      name: event.toolName,
+      args: event.args && typeof event.args === "object" ? event.args : {},
+    });
   });
 
   // Update status bar on voice:config events (from TUI, alt+v, etc.)
@@ -2053,6 +2403,10 @@ export default function (pi: ExtensionAPI) {
       const effective = getEffective();
       const next = !effective.enabled;
       session.enabled = next;
+      if (!next) {
+        speechScheduler.cancelAll("tts-disabled");
+        streamBuffer = "";
+      }
       persistSession();
       ctx.ui.notify(`TTS ${next ? "enabled" : "disabled"}`, "info");
       pi.events.emit("voice:config", {

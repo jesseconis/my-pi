@@ -23,6 +23,8 @@ const PACKAGE_ROOT = resolve(__dirname, "..");
 const CONFIG_DIR = resolve(process.env.PI_VOICE_DIR ?? join(homedir(), ".pi", "voice"));
 const CONFIG_FILE = resolve(CONFIG_DIR, "config.json");
 const EXAMPLE_CONFIG = resolve(PACKAGE_ROOT, "config", "voice-config.example.json");
+const PRONUNCIATION_FILE = resolve(CONFIG_DIR, "pronunciations.json");
+const EXAMPLE_PRONUNCIATIONS = resolve(PACKAGE_ROOT, "config", "pronunciations.example.json");
 
 if (existsSync(CONFIG_FILE)) {
   console.log("pi-voice: Configuration file already exists at", CONFIG_FILE);
@@ -31,4 +33,7 @@ if (existsSync(CONFIG_FILE)) {
 
 mkdirSync(CONFIG_DIR, { recursive: true });
 copyFileSync(EXAMPLE_CONFIG, CONFIG_FILE);
+if (!existsSync(PRONUNCIATION_FILE)) {
+  copyFileSync(EXAMPLE_PRONUNCIATIONS, PRONUNCIATION_FILE);
+}
 console.log("pi-voice: Wrote example configuration to", CONFIG_FILE);
